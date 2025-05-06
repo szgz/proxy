@@ -11,33 +11,34 @@ DOMAIN_ROOT="frankwong.dpdns.org"
 
 echo "📦 安装依赖..."
 apt update -y
-apt install -y curl wget unzip git jq qrencode build-essential pkg-config libssl-dev
+apt install -y curl wget unzip git jq qrencode
 
 # ========== 停止可能存在的服务 ==========
 echo "🛑 停止 cloudflared..."
 systemctl stop cloudflared || true
 
-echo "🛑 停止 mieru.service..."
-systemctl stop mieru || true
+echo "🛑 停止 mita.service..."
+systemctl stop mita || true
 
 # ========== 安装 cloudflared ==========
 echo "📥 安装 cloudflared..."
 wget -O /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
 chmod +x /usr/local/bin/cloudflared
 
-# ========== 安装 Mieru Proxy ==========
-echo "📥 安装 Mieru Proxy..."
-if ! command -v cargo &> /dev/null; then
-  echo "🚧 安装 Rust 工具链..."
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  source $HOME/.cargo/env
+# ========== 安装 Mita (Mieru Server) ==========
+echo "📥 安装 Mita..."
+ARCH=$(uname -m)
+if [ "$ARCH" == "x86_64" ]; then
+  MITA_PKG="mita_3.14.1_amd64.deb"
+elif [ "$ARCH" == "aarch64" ]; then
+  MITA_PKG="mita_3.14.1_arm64.deb"
+else
+  echo "❌ 不支持的架构: $ARCH"
+  exit 1
 fi
 
-git clone https://github.com/fooooooooooo/mieru.git /opt/mieru || true
-cd /opt/mieru
-cargo build --release
-cp target/release/mieru /usr/local/bin/mieru
-chmod +x /usr/local/bin/mieru
+wget https://github.com/enfein/mieru/releases/download/v3.14.1/$MITA_PKG
+dpkg -i $MITA_PKG
 
 # ========== Cloudflare 登录授权 ==========
 echo "🌐 请在弹出的浏览器中登录 Cloudflare 账户以授权此主机..."
@@ -70,23 +71,31 @@ ingress:
   - service: http_status:404
 EOF
 
+# ========== 配置 Mita ==========
+echo "🛠️ 配置 Mita..."
+cat <<EOF > /etc/mita_config.json
+{
+    "portBindings": [
+        {
+            "port": 3080,
+            "protocol": "TCP"
+        }
+    ],
+    "users": [
+        {
+            "name": "user1",
+            "password": "pass1"
+        }
+    ],
+    "loggingLevel": "INFO"
+}
+EOF
+
+mita apply config /etc/mita_config.json
+mita start
+
 # ========== 配置 systemd ==========
 echo "🛠️ 写入 systemd 服务..."
-
-cat <<EOF > /etc/systemd/system/mieru.service
-[Unit]
-Description=Mieru Proxy
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/mieru serve --port 3080
-Restart=on-failure
-User=root
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
 
 cat <<EOF > /etc/systemd/system/cloudflared.service
 [Unit]
@@ -106,9 +115,7 @@ EOF
 # ========== 启动服务 ==========
 echo "🔄 启动服务..."
 systemctl daemon-reload
-systemctl enable mieru
 systemctl enable cloudflared
-systemctl restart mieru
 systemctl restart cloudflared
 
 sleep 5
