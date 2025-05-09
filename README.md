@@ -13,7 +13,8 @@
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/szgz/proxy/main/install.sh)
-
+```bash
 或者
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/szgz/proxy/main/sb.sh)
+```bash
