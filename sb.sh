@@ -2,16 +2,16 @@
 
 #========================================================
 # Project: sing-box mult-user management script
-# Version: 1.0.3
-# Author: gusarg84 <gusarg84@gmail.com>
-# Blog: https://www.ygxb.org
-# Github: https://github.com/frank-cn-2000/sing-box-yg
+# Version: 1.0.4 (Updated with Cloudflare Tunnel & improved deps)
+# Author: gusarg84 <gusarg84@gmail.com> (Cloudflare integration)
+# Original Base Author: frank-cn-2000 <https://github.com/frank-cn-2000/sing-box-yg>
+# Cloudflare Tunnel based on logic from szgz/proxy
 #========================================================
 
-VERSION="1.0.3" # Script version
-SCRIPT_UPDATE_DATE="2024-03-08" # Script update date
+VERSION="1.0.4" # Script version
+SCRIPT_UPDATE_DATE="2024-05-02" # Script update date
 
-# Global Variables (some from original script, some new)
+# Global Variables
 # Colors
 RED="\033[31m"
 GREEN="\033[32m"
@@ -19,9 +19,9 @@ YELLOW="\033[33m"
 BLUE="\033[36m"
 PLAIN="\033[0m"
 
-# Paths (some from original script, some new)
+# Paths
 SING_BOX_CONFIG_PATH="/usr/local/etc/sing-box/"
-SING_BOX_INFO_PATH="/etc/sing-box-yg/"
+SING_BOX_INFO_PATH="/etc/sing-box-yg/" # Used by original script for storing info
 SING_BOX_BIN_PATH="/usr/local/bin/sing-box"
 SING_BOX_SERVICE_NAME="sing-box"
 
@@ -72,10 +72,12 @@ check_os() {
         OS_RELEASE="debian"
         OS_VERSION=$(cat /etc/debian_version)
     elif [[ -f /etc/redhat-release ]]; then
-        OS_RELEASE=$(cat /etc/redhat-release | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')
-        OS_VERSION=$(cat /etc/redhat-release | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+        # For CentOS, RHEL, AlmaLinux, Rocky etc.
+        OS_RELEASE=$(grep -oE '^(CentOS|AlmaLinux|Rocky|Red Hat Enterprise Linux)' /etc/redhat-release | head -1 | tr '[:upper:]' '[:lower:]' | sed 's/red hat enterprise linux/rhel/')
+        [[ -z "$OS_RELEASE" ]] && OS_RELEASE=$(cat /etc/redhat-release | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]') # Fallback
+        OS_VERSION=$(grep -oE '[0-9]+(\.[0-9]+)?' /etc/redhat-release | head -1)
     else
-        echo_error "Unsupported OS"
+        echo_error "Unsupported OS detection method."
         exit 1
     fi
 
@@ -95,38 +97,102 @@ check_os() {
 }
 
 
-# Check dependencies (add jq if not already checked by original sb.sh)
+# Check dependencies
 check_dependencies() {
-    local dependencies=("curl" "wget" "jq" "openssl" "uuid-runtime") # uuid-runtime for uuidgen
+    local dependencies=("curl" "wget" "jq" "openssl" "uuid-runtime") # uuid-runtime for uuidgen command
     local missing_deps=()
+    echo_info "Checking for required dependencies: ${dependencies[*]}"
     for dep in "${dependencies[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then
+        # For uuid-runtime, we actually check for the command `uuidgen`
+        if [[ "$dep" == "uuid-runtime" ]]; then
+            if ! command -v "uuidgen" &>/dev/null; then
+                missing_deps+=("$dep") # Add the package name we'll try to install
+            fi
+        elif ! command -v "$dep" &>/dev/null; then
             missing_deps+=("$dep")
         fi
     done
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        echo_warning "Missing dependencies: ${missing_deps[*]}"
-        if [[ "$OS_RELEASE" == "ubuntu" || "$OS_RELEASE" == "debian" ]]; then
-            echo_info "Attempting to install missing dependencies..."
-            sudo apt update >/dev/null 2>&1
-            sudo apt install -y "${missing_deps[@]}" >/dev/null 2>&1
-        elif [[ "$OS_RELEASE" == "centos" || "$OS_RELEASE" == "almalinux" || "$OS_RELEASE" == "rocky" ]]; then
-            echo_info "Attempting to install missing dependencies..."
-            sudo yum install -y epel-release >/dev/null 2>&1 # For jq and uuid on older CentOS
-            sudo yum install -y "${missing_deps[@]}" >/dev/null 2>&1
+        echo_warning "Missing dependencies or commands: ${missing_deps[*]}"
+        # Attempt to install based on OS
+        if [[ "$OS_RELEASE" == "ubuntu" || "$OS_RELEASE" == "debian" || "$OS_RELEASE" == "raspbian" ]]; then
+            echo_info "Attempting to install missing dependencies for Debian/Ubuntu based system..."
+            echo_info "Running apt update (this may take a moment)..."
+            if ! sudo apt update; then
+                echo_error "apt update failed. Please check your network and apt sources."
+                echo_warning "You might need to run 'sudo apt update' manually and then re-run this script."
+            fi
+            echo_info "Attempting to install: ${missing_deps[*]}"
+            if ! sudo apt install -y "${missing_deps[@]}"; then
+                echo_error "Failed to install one or more dependencies using apt: ${missing_deps[*]}"
+                echo_warning "Please try installing them manually and then re-run the script."
+            else
+                echo_success "Successfully attempted to install: ${missing_deps[*]}"
+            fi
+        elif [[ "$OS_RELEASE" == "centos" || "$OS_RELEASE" == "almalinux" || "$OS_RELEASE" == "rocky" || "$OS_RELEASE" == "rhel" ]]; then
+            echo_info "Attempting to install missing dependencies for RHEL based system..."
+            echo_info "Running yum makecache (this may take a moment)..."
+            sudo yum makecache
+            
+            local rhel_deps_to_install=()
+            for dep_item in "${missing_deps[@]}"; do
+                if [[ "$dep_item" == "uuid-runtime" ]]; then
+                    # On RHEL-like systems, uuidgen is part of util-linux
+                    if ! rpm -q util-linux &>/dev/null || ! command -v uuidgen &>/dev/null; then
+                        rhel_deps_to_install+=("util-linux")
+                    fi
+                else
+                    rhel_deps_to_install+=("$dep_item")
+                fi
+            done
+            # Remove duplicates just in case
+            rhel_deps_to_install=($(echo "${rhel_deps_to_install[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+
+            if [[ ${#rhel_deps_to_install[@]} -gt 0 ]]; then
+                echo_info "Attempting to install with yum: ${rhel_deps_to_install[*]}"
+                # Ensure EPEL is enabled if jq or other common tools are missing (often needed for jq)
+                if [[ " ${rhel_deps_to_install[*]} " =~ " jq " ]] && ! rpm -q epel-release &>/dev/null && [[ "$OS_VERSION" =~ ^[789] ]]; then
+                    echo_info "EPEL repository not found or jq is missing. Attempting to install EPEL release..."
+                    sudo yum install -y epel-release
+                    sudo yum makecache # Refresh cache after adding EPEL
+                fi
+
+                 if ! sudo yum install -y "${rhel_deps_to_install[@]}"; then
+                    echo_error "Failed to install one or more dependencies using yum: ${rhel_deps_to_install[*]}"
+                    echo_warning "Please try installing them manually and then re-run the script."
+                 else
+                    echo_success "Successfully attempted to install with yum: ${rhel_deps_to_install[*]}"
+                 fi
+            else
+                echo_info "No new packages identified for installation via yum for the listed missing commands."
+            fi
         else
-            echo_error "Please install the following dependencies manually: ${missing_deps[*]}"
+            echo_error "Unsupported OS for automatic dependency installation: ${OS_RELEASE}"
+            echo_warning "Please install the following dependencies/commands manually: ${missing_deps[*]}"
             exit 1
         fi
+
         # Re-check after attempting installation
-        for dep in "${missing_deps[@]}"; do
-            if ! command -v "$dep" &>/dev/null; then
-                echo_error "Failed to install dependency: $dep. Please install it manually."
-                exit 1
+        local still_missing_commands=()
+        for dep_pkg_name in "${dependencies[@]}"; do
+            local cmd_to_check="$dep_pkg_name"
+            if [[ "$dep_pkg_name" == "uuid-runtime" ]]; then
+                cmd_to_check="uuidgen"
+            fi
+            if ! command -v "$cmd_to_check" &>/dev/null; then
+                still_missing_commands+=("$cmd_to_check (expected from $dep_pkg_name or equivalent)")
             fi
         done
-        echo_success "Dependencies installed."
+
+        if [[ ${#still_missing_commands[@]} -gt 0 ]]; then
+            echo_error "Critical commands still missing after installation attempt: ${still_missing_commands[*]}"
+            echo_error "Please ensure these commands are available and re-run the script."
+            exit 1
+        fi
+        echo_success "All required dependencies appear to be installed and commands available."
+    else
+        echo_success "All required dependencies are already installed and commands available."
     fi
 }
 
@@ -142,7 +208,6 @@ check_cloudflared_arch() {
     case $(uname -m) in
     i386 | i686) ARCH_CLOUDFLARED="386" ;;
     x86_64 | amd64) ARCH_CLOUDFLARED="amd64" ;;
-    # cloudflared uses 'arm' for armv7 and 'arm64' for aarch64
     armv5tel | armv6l | armv7l | armv8l) ARCH_CLOUDFLARED="arm" ;;
     aarch64 | arm64) ARCH_CLOUDFLARED="arm64" ;;
     *)
@@ -167,14 +232,14 @@ install_cloudflared_executable() {
         if curl -Lso "${CLOUDFLARED_BIN}" "${download_url}"; then
             echo_success "Cloudflared downloaded via curl."
         else
-            echo_error "Download failed using curl. Please check your network or the URL."
+            echo_error "Download failed using curl. Please check your network or the URL: ${download_url}"
             return 1
         fi
     elif command -v wget >/dev/null 2>&1; then
         if wget -qO "${CLOUDFLARED_BIN}" "${download_url}"; then
             echo_success "Cloudflared downloaded via wget."
         else
-            echo_error "Download failed using wget. Please check your network or the URL."
+            echo_error "Download failed using wget. Please check your network or the URL: ${download_url}"
             return 1
         fi
     else
@@ -199,7 +264,6 @@ get_singbox_listen_port() {
     local port=""
 
     if [[ -f "$info_file" ]]; then
-        # Try to get common listen ports from info.json, prioritize reality, then general listen_port
         port=$(jq -r '.reality_listen_port // .listen_port // .inbounds[0].listen_port // ""' "$info_file" 2>/dev/null)
         if [[ -n "$port" && "$port" != "null" && "$port" != "" ]]; then
             echo "$port"
@@ -207,10 +271,7 @@ get_singbox_listen_port() {
         fi
     fi
 
-    # Fallback: try to parse config.json directly for a common inbound port
     if [[ -f "$config_file" ]]; then
-        # Look for common inbound types and their listen_port
-        # This tries to find the first listen_port from various common inbound types
         port=$(jq -r '
             .inbounds[] |
             select(.type=="vmess" or .type=="vless" or .type=="trojan" or .type=="shadowsocks" or .type=="hysteria2" or .type=="tuic" or .type=="mixed") |
@@ -219,14 +280,13 @@ get_singbox_listen_port() {
             tostring' "$config_file" | head -n 1)
 
         if [[ -n "$port" && "$port" != "null" && "$port" != "" ]]; then
-            echo_info "Found port $port from $config_file for a primary inbound."
+            echo_info "Found port $port from a primary inbound in $config_file."
             echo "$port"
             return 0
         fi
-        # If still not found, try any inbound's listen_port
         port=$(jq -r '.inbounds[0].listen_port // ""' "$config_file" 2>/dev/null)
          if [[ -n "$port" && "$port" != "null" && "$port" != "" ]]; then
-            echo_info "Found port $port from first inbound in $config_file."
+            echo_info "Found port $port from the first inbound in $config_file."
             echo "$port"
             return 0
         fi
@@ -238,7 +298,7 @@ get_singbox_listen_port() {
         echo "$manual_port"
         return 0
     else
-        echo_error "Invalid port entered."
+        echo_error "Invalid port entered: $manual_port"
         return 1
     fi
 }
@@ -248,6 +308,7 @@ install_cloudflare_tunnel_service() {
     check_root
     if [[ ! -f "${SING_BOX_CONFIG_PATH}config.json" ]]; then
         echo_error "Sing-box does not appear to be installed. Please install Sing-box first."
+        press_to_continue
         return 1
     fi
 
@@ -293,6 +354,7 @@ install_cloudflare_tunnel_service() {
     singbox_port=$(get_singbox_listen_port)
     if [[ $? -ne 0 || -z "$singbox_port" ]]; then
         echo_error "Failed to get Sing-box port. Aborting tunnel setup."
+        press_to_continue
         return 1
     fi
     echo_info "Sing-box is detected/configured to be listening on port: ${YELLOW}${singbox_port}${PLAIN}"
@@ -309,6 +371,7 @@ install_cloudflare_tunnel_service() {
     read -rp "Paste your Cloudflare Tunnel Token here: " cf_token
     if [[ -z "$cf_token" ]]; then
         echo_error "No token provided. Aborting."
+        press_to_continue
         return 1
     fi
 
@@ -349,6 +412,7 @@ install_cloudflare_tunnel_service() {
         echo_error "You might need to run: journalctl -u ${CLOUDFLARED_SERVICE_NAME} or check system logs."
         echo_error "Ensure the token was correct and that ${CLOUDFLARED_BIN} has execute permissions."
     fi
+    press_to_continue
 }
 
 # Function to uninstall Cloudflare Tunnel service
@@ -395,11 +459,13 @@ uninstall_cloudflare_tunnel_service() {
     
     echo_info "Cloudflare Tunnel uninstallation process complete."
     echo_warning "You may also want to delete the tunnel from your Cloudflare Zero Trust dashboard."
+    press_to_continue
 }
 
 
 # Manage Cloudflare Tunnel Menu
 manage_cloudflare_tunnel() {
+    clear
     echo_line
     echo_color "${GREEN}" "Cloudflare Tunnel Management"
     echo_color "${CYAN}" "------------------------------------"
@@ -432,6 +498,7 @@ manage_cloudflare_tunnel() {
         else
             echo_error "Cloudflared service is not installed."
         fi
+        press_to_continue
         ;;
     4)
         if $service_exists; then
@@ -439,6 +506,7 @@ manage_cloudflare_tunnel() {
         else
             echo_error "Cloudflared service is not installed."
         fi
+        press_to_continue
         ;;
     5)
         if $service_exists; then
@@ -446,6 +514,7 @@ manage_cloudflare_tunnel() {
         else
             echo_error "Cloudflared service is not installed."
         fi
+        press_to_continue
         ;;
     6)
         if $service_exists; then
@@ -453,47 +522,79 @@ manage_cloudflare_tunnel() {
         else
             echo_error "Cloudflared service is not installed."
         fi
+        press_to_continue
         ;;
     7)
         if $service_exists; then
+            echo_info "Displaying logs for ${CLOUDFLARED_SERVICE_NAME}. Press Ctrl+C to exit."
             sudo journalctl -u "${CLOUDFLARED_SERVICE_NAME}" -f --no-pager
         else
             echo_error "Cloudflared service is not installed."
         fi
+        # No press_to_continue here as journalctl -f needs to be exited manually
         ;;
     0)
         return
         ;;
     *)
         echo_error "Invalid choice."
+        press_to_continue
         ;;
     esac
+    # Loop back to cloudflare menu if not returning to main
     if [[ "$sub_choice" != "0" ]]; then
-        press_to_continue
+        manage_cloudflare_tunnel
     fi
 }
 
 # Placeholder for existing sing-box functions (from original sb.sh)
-# These functions would be defined here in the actual script.
-# For brevity, I'm not re-listing all of them but they are essential.
-
-install_sing_box() { echo_info "Placeholder for install_sing_box function"; }
-uninstall_sing_box() { echo_info "Placeholder for uninstall_sing_box function"; }
-manage_sing_box_service() { echo_info "Placeholder for manage_sing_box_service function"; }
-manage_sing_box_config() { echo_info "Placeholder for manage_sing_box_config function"; }
-manage_users() { echo_info "Placeholder for manage_users function"; }
-generate_client_config() { echo_info "Placeholder for generate_client_config function"; }
-view_logs() { echo_info "Placeholder for view_logs function"; }
-update_script() { echo_info "Placeholder for update_script function"; }
-update_sing_box_core() { echo_info "Placeholder for update_sing_box_core function"; }
-# Add any other functions from the original sb.sh
+# These functions MUST be properly defined in the actual script you use.
+# For brevity, I'm not re-listing all of them. Ensure they are present.
+# --- BEGINNING OF PLACEHOLDER SING-BOX FUNCTIONS ---
+install_sing_box() { echo_warning "Function 'install_sing_box' is a placeholder. Implement or merge from original script."; press_to_continue; }
+uninstall_sing_box() { echo_warning "Function 'uninstall_sing_box' is a placeholder. Implement or merge from original script."; press_to_continue; }
+manage_sing_box_service() { echo_warning "Function 'manage_sing_box_service' is a placeholder. Implement or merge from original script."; press_to_continue; }
+manage_sing_box_config() { echo_warning "Function 'manage_sing_box_config' is a placeholder. Implement or merge from original script."; press_to_continue; }
+manage_users() { echo_warning "Function 'manage_users' is a placeholder. Implement or merge from original script."; press_to_continue; }
+generate_client_config() { echo_warning "Function 'generate_client_config' is a placeholder. Implement or merge from original script."; press_to_continue; }
+view_logs() { echo_warning "Function 'view_logs' is a placeholder. Implement or merge from original script."; press_to_continue; }
+update_script() {
+    echo_info "Checking for script updates..."
+    # Example update mechanism - adapt to your actual script source
+    local current_script_url="https://raw.githubusercontent.com/szgz/proxy/main/sb.sh" # Example URL
+    local temp_script="/tmp/sb_update.sh"
+    if curl -Lso "$temp_script" "$current_script_url"; then
+        # Basic check: see if downloaded script is different and has a version string
+        if grep -q "VERSION=" "$temp_script" && ! cmp -s "$0" "$temp_script"; then
+            echo_success "New version found. Replacing current script."
+            # Make sure the new script is executable
+            chmod +x "$temp_script"
+            # Replace current script with the new one
+            if mv "$temp_script" "$0"; then
+                echo_success "Script updated successfully. Please re-run the script."
+                exit 0
+            else
+                echo_error "Failed to replace the script. Check permissions."
+                rm -f "$temp_script"
+            fi
+        else
+            echo_info "You are already using the latest version or the update check failed."
+            rm -f "$temp_script"
+        fi
+    else
+        echo_error "Failed to download the update script. Check network or URL."
+    fi
+    press_to_continue
+}
+update_sing_box_core() { echo_warning "Function 'update_sing_box_core' is a placeholder. Implement or merge from original script."; press_to_continue; }
+# --- END OF PLACEHOLDER SING-BOX FUNCTIONS ---
 
 # Main Menu
 main_menu() {
     clear
     echo_color "${YELLOW}" "=================================================================="
     echo_color "${GREEN}"  " sing-box Multi-User Management Script  Version: ${VERSION}"
-    echo_color "${BLUE}"   " Author: gusarg84 (Original by frank-cn-2000)"
+    echo_color "${BLUE}"   " Script Date: ${SCRIPT_UPDATE_DATE}"
     echo_color "${YELLOW}" "=================================================================="
     echo_color "${CYAN}"   "Current system time: $(date +"%Y-%m-%d %H:%M:%S")"
     echo_line
@@ -501,17 +602,16 @@ main_menu() {
     echo -e "  ${GREEN}2.${PLAIN} Uninstall Sing-box"
     echo -e "  ${GREEN}3.${PLAIN} Manage Sing-box Service"
     echo -e "  ${GREEN}4.${PLAIN} Manage Sing-box Configuration"
-    echo -e "  ${GREEN}5.${PLAIN} Manage Users"
-    echo -e "  ${GREEN}6.${PLAIN} Generate Client Configuration / QR Code"
-    echo -e "  ${GREEN}7.${PLAIN} View Sing-box Logs"
-    echo -e "  ${GREEN}8.${PLAIN} Update Sing-box Core"
+    echo -e "  ${GREEN}5.${PLAIN} Manage Users (Placeholder)"
+    echo -e "  ${GREEN}6.${PLAIN} Generate Client Configuration / QR Code (Placeholder)"
+    echo -e "  ${GREEN}7.${PLAIN} View Sing-box Logs (Placeholder)"
+    echo -e "  ${GREEN}8.${PLAIN} Update Sing-box Core (Placeholder)"
     echo -e "  ${GREEN}9.${PLAIN} Update This Script"
-    echo -e "  ${GREEN}10.${PLAIN} Manage Cloudflare Tunnel ${RED}(New!)${PLAIN}" # New Option
-    # If you had other options like Warp, adjust numbering accordingly
+    echo -e "  ${GREEN}10.${PLAIN} Manage Cloudflare Tunnel ${RED}(New!)${PLAIN}"
     echo_line
     echo -e "  ${GREEN}0.${PLAIN} Exit Script"
     echo_color "${BLUE}" "------------------------------------------------------------------"
-    read -rp "Please enter your choice [0-10]: " choice # Adjusted range
+    read -rp "Please enter your choice [0-10]: " choice
 
     case "$choice" in
     1) install_sing_box ;;
@@ -523,7 +623,7 @@ main_menu() {
     7) view_logs ;;
     8) update_sing_box_core ;;
     9) update_script ;;
-    10) manage_cloudflare_tunnel ;; # New case
+    10) manage_cloudflare_tunnel ;;
     0)
         echo_success "Exiting script. Goodbye!"
         exit 0
@@ -542,8 +642,10 @@ main_menu() {
 
 # --- Script Initialization ---
 check_root
+clear # Clear screen before starting
+echo_info "Initializing Sing-box Management Script..."
 check_os
-check_dependencies # Ensure this is called
+check_dependencies # Crucial step
 
 # Start main menu
 main_menu
