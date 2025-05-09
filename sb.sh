@@ -1,17 +1,17 @@
 #!/bin/bash
 
-#========================================================
-# Project: sing-box mult-user management script
-# Version: 1.0.4 (Updated with Cloudflare Tunnel & improved deps)
-# Author: gusarg84 <gusarg84@gmail.com> (Cloudflare integration)
-# Original Base Author: frank-cn-2000 <https://github.com/frank-cn-2000/sing-box-yg>
-# Cloudflare Tunnel based on logic from szgz/proxy
-#========================================================
+#=========================================================================================
+# Project: sing-box Multi-User Management Script with Cloudflare Tunnel
+# Version: 2.0.0 (Merged Version)
+# Base Script Author: frank-cn-2000 <https://github.com/frank-cn-2000/sing-box-yg>
+# Cloudflare Tunnel Integration & Enhancements: AI Assistant / szgz methodology
+# Script Update Date: 2024-05-09
+#=========================================================================================
 
-VERSION="1.0.4" # Script version
-SCRIPT_UPDATE_DATE="2024-05-02" # Script update date
+# --- Global Variables & Configuration ---
+SCRIPT_VERSION="2.0.0"
+SCRIPT_UPDATE_DATE="2024-05-09" # Date of this merge
 
-# Global Variables
 # Colors
 RED="\033[31m"
 GREEN="\033[32m"
@@ -20,11 +20,16 @@ BLUE="\033[36m"
 PLAIN="\033[0m"
 
 # Paths
-SING_BOX_CONFIG_PATH="/usr/local/etc/sing-box/"
-SING_BOX_INFO_PATH="/etc/sing-box-yg/" # Used by original script for storing info
+# Main Sing-box paths (from original script, slightly standardized naming)
 SING_BOX_BIN_PATH="/usr/local/bin/sing-box"
-SING_BOX_SERVICE_NAME="sing-box"
+SING_BOX_CONFIG_FILE="/usr/local/etc/sing-box/config.json" # Main config
+SING_BOX_USER_INFO_FILE="/etc/sing-box-yg/info.json"      # User & port info by frank-cn-2000 script
+SING_BOX_LOG_FILE="/var/log/sing-box.log"
+SING_BOX_SERVICE_FILE="/etc/systemd/system/sing-box.service"
+SING_BOX_CONFIG_PATH_DIR="/usr/local/etc/sing-box/" # Directory for config
+SING_BOX_INFO_PATH_DIR="/etc/sing-box-yg/"          # Directory for info file
 
+# Cloudflared paths
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 CLOUDFLARED_SERVICE_NAME="cloudflared"
 CLOUDFLARED_CONFIG_DIR="/etc/cloudflared"
@@ -32,30 +37,26 @@ CLOUDFLARED_CONFIG_DIR="/etc/cloudflared"
 # OS detection variables
 OS_RELEASE=""
 OS_VERSION=""
-OS_ARCH=""
+OS_ARCH="" # System architecture (amd64, arm64, etc.)
+SING_BOX_ARCH="" # Architecture mapping for sing-box releases
 
-# Function to output colored text
-echo_color() {
-    local color=$1
-    shift
-    echo -e "${color}$*${PLAIN}"
-}
-
+# --- Helper Functions ---
+echo_color() { local color=$1; shift; echo -e "${color}$*${PLAIN}"; }
 echo_error() { echo_color "${RED}" "$@"; }
 echo_success() { echo_color "${GREEN}" "$@"; }
 echo_warning() { echo_color "${YELLOW}" "$@"; }
 echo_info() { echo_color "${BLUE}" "$@"; }
 echo_line() { echo "--------------------------------------------------------------------"; }
 
-# Check root
+press_to_continue() { echo_info "Press Enter to continue..."; read -r; }
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo_error "This script must be run as root"
+        echo_error "Error: This script must be run as root."
         exit 1
     fi
 }
 
-# Check OS
 check_os() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
@@ -69,12 +70,10 @@ check_os() {
         OS_RELEASE=$DISTRIB_ID
         OS_VERSION=$DISTRIB_RELEASE
     elif [[ -f /etc/debian_version ]]; then
-        OS_RELEASE="debian"
-        OS_VERSION=$(cat /etc/debian_version)
+        OS_RELEASE="debian"; OS_VERSION=$(cat /etc/debian_version)
     elif [[ -f /etc/redhat-release ]]; then
-        # For CentOS, RHEL, AlmaLinux, Rocky etc.
         OS_RELEASE=$(grep -oE '^(CentOS|AlmaLinux|Rocky|Red Hat Enterprise Linux)' /etc/redhat-release | head -1 | tr '[:upper:]' '[:lower:]' | sed 's/red hat enterprise linux/rhel/')
-        [[ -z "$OS_RELEASE" ]] && OS_RELEASE=$(cat /etc/redhat-release | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]') # Fallback
+        [[ -z "$OS_RELEASE" ]] && OS_RELEASE=$(cat /etc/redhat-release | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')
         OS_VERSION=$(grep -oE '[0-9]+(\.[0-9]+)?' /etc/redhat-release | head -1)
     else
         echo_error "Unsupported OS detection method."
@@ -82,518 +81,586 @@ check_os() {
     fi
 
     case $(uname -m) in
-    i386 | i686) OS_ARCH="386" ;;
-    x86_64 | amd64) OS_ARCH="amd64" ;;
-    armv5tel) OS_ARCH="armv5" ;;
-    armv6l) OS_ARCH="armv6" ;; # raspberry pi
-    armv7l | armv8l) OS_ARCH="armv7" ;; # arm32
-    aarch64 | arm64) OS_ARCH="arm64" ;; # arm64
-    *)
-        echo_error "Unsupported architecture: $(uname -m)"
-        exit 1
-        ;;
+        i386 | i686) OS_ARCH="386"; SING_BOX_ARCH="386" ;;
+        x86_64 | amd64) OS_ARCH="amd64"; SING_BOX_ARCH="amd64" ;;
+        armv5tel) OS_ARCH="armv5"; SING_BOX_ARCH="armv5" ;;
+        armv6l) OS_ARCH="armv6"; SING_BOX_ARCH="armv6" ;;
+        armv7l | armv8l) OS_ARCH="armv7"; SING_BOX_ARCH="armv7" ;; # sing-box uses armv7
+        aarch64 | arm64) OS_ARCH="arm64"; SING_BOX_ARCH="arm64" ;;
+        s390x) OS_ARCH="s390x"; SING_BOX_ARCH="s390x" ;;
+        riscv64) OS_ARCH="riscv64"; SING_BOX_ARCH="riscv64" ;;
+        *) echo_error "Unsupported architecture: $(uname -m)"; exit 1 ;;
     esac
-    echo_info "OS: ${OS_RELEASE} ${OS_VERSION}, Arch: ${OS_ARCH}"
+    echo_info "OS: ${OS_RELEASE} ${OS_VERSION}, System Arch: ${OS_ARCH}, Sing-box Arch: ${SING_BOX_ARCH}"
 }
 
-
-# Check dependencies
 check_dependencies() {
-    local dependencies=("curl" "wget" "jq" "openssl" "uuid-runtime") # uuid-runtime for uuidgen command
-    local missing_deps=()
-    echo_info "Checking for required dependencies: ${dependencies[*]}"
-    for dep in "${dependencies[@]}"; do
-        # For uuid-runtime, we actually check for the command `uuidgen`
-        if [[ "$dep" == "uuid-runtime" ]]; then
-            if ! command -v "uuidgen" &>/dev/null; then
-                missing_deps+=("$dep") # Add the package name we'll try to install
-            fi
-        elif ! command -v "$dep" &>/dev/null; then
-            missing_deps+=("$dep")
+    local dependencies=("curl" "wget" "jq" "openssl" "uuid-runtime" "qrencode")
+    local missing_deps_pkg_names=() # Package names to install
+    local missing_commands=() # Actual commands missing
+
+    echo_info "Checking for required commands/packages: ${dependencies[*]}"
+    for dep_pkg_name in "${dependencies[@]}"; do
+        local cmd_to_check="$dep_pkg_name"
+        case "$dep_pkg_name" in
+            "uuid-runtime") cmd_to_check="uuidgen" ;;
+            "qrencode") cmd_to_check="qrencode" ;;
+        esac
+        if ! command -v "$cmd_to_check" &>/dev/null; then
+            missing_deps_pkg_names+=("$dep_pkg_name")
+            missing_commands+=("$cmd_to_check")
         fi
     done
 
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        echo_warning "Missing dependencies or commands: ${missing_deps[*]}"
-        # Attempt to install based on OS
+    if [[ ${#missing_deps_pkg_names[@]} -gt 0 ]]; then
+        echo_warning "Missing commands/packages: Pkgs to check: [${missing_deps_pkg_names[*]}] for commands: [${missing_commands[*]}]"
         if [[ "$OS_RELEASE" == "ubuntu" || "$OS_RELEASE" == "debian" || "$OS_RELEASE" == "raspbian" ]]; then
-            echo_info "Attempting to install missing dependencies for Debian/Ubuntu based system..."
-            echo_info "Running apt update (this may take a moment)..."
-            if ! sudo apt update; then
-                echo_error "apt update failed. Please check your network and apt sources."
-                echo_warning "You might need to run 'sudo apt update' manually and then re-run this script."
-            fi
-            echo_info "Attempting to install: ${missing_deps[*]}"
-            if ! sudo apt install -y "${missing_deps[@]}"; then
-                echo_error "Failed to install one or more dependencies using apt: ${missing_deps[*]}"
-                echo_warning "Please try installing them manually and then re-run the script."
-            else
-                echo_success "Successfully attempted to install: ${missing_deps[*]}"
-            fi
+            echo_info "Attempting to install for Debian/Ubuntu..."
+            echo_info "Running apt update..."
+            sudo apt update
+            echo_info "Attempting to install: ${missing_deps_pkg_names[*]}"
+            if ! sudo apt install -y "${missing_deps_pkg_names[@]}"; then
+                 echo_error "Failed with apt: ${missing_deps_pkg_names[*]}"
+            else echo_success "Apt install attempt finished for: ${missing_deps_pkg_names[*]}"; fi
         elif [[ "$OS_RELEASE" == "centos" || "$OS_RELEASE" == "almalinux" || "$OS_RELEASE" == "rocky" || "$OS_RELEASE" == "rhel" ]]; then
-            echo_info "Attempting to install missing dependencies for RHEL based system..."
-            echo_info "Running yum makecache (this may take a moment)..."
-            sudo yum makecache
-            
-            local rhel_deps_to_install=()
-            for dep_item in "${missing_deps[@]}"; do
-                if [[ "$dep_item" == "uuid-runtime" ]]; then
-                    # On RHEL-like systems, uuidgen is part of util-linux
-                    if ! rpm -q util-linux &>/dev/null || ! command -v uuidgen &>/dev/null; then
-                        rhel_deps_to_install+=("util-linux")
-                    fi
-                else
-                    rhel_deps_to_install+=("$dep_item")
-                fi
+            echo_info "Attempting to install for RHEL-based..."
+            local rhel_install_list=()
+            for pkg in "${missing_deps_pkg_names[@]}"; do
+                [[ "$pkg" == "uuid-runtime" ]] && rhel_install_list+=("util-linux") || rhel_install_list+=("$pkg")
             done
-            # Remove duplicates just in case
-            rhel_deps_to_install=($(echo "${rhel_deps_to_install[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
-
-            if [[ ${#rhel_deps_to_install[@]} -gt 0 ]]; then
-                echo_info "Attempting to install with yum: ${rhel_deps_to_install[*]}"
-                # Ensure EPEL is enabled if jq or other common tools are missing (often needed for jq)
-                if [[ " ${rhel_deps_to_install[*]} " =~ " jq " ]] && ! rpm -q epel-release &>/dev/null && [[ "$OS_VERSION" =~ ^[789] ]]; then
-                    echo_info "EPEL repository not found or jq is missing. Attempting to install EPEL release..."
-                    sudo yum install -y epel-release
-                    sudo yum makecache # Refresh cache after adding EPEL
-                fi
-
-                 if ! sudo yum install -y "${rhel_deps_to_install[@]}"; then
-                    echo_error "Failed to install one or more dependencies using yum: ${rhel_deps_to_install[*]}"
-                    echo_warning "Please try installing them manually and then re-run the script."
-                 else
-                    echo_success "Successfully attempted to install with yum: ${rhel_deps_to_install[*]}"
-                 fi
-            else
-                echo_info "No new packages identified for installation via yum for the listed missing commands."
+            rhel_install_list=($(echo "${rhel_install_list[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')) # Unique
+            
+            if [[ " ${rhel_install_list[*]} " =~ " jq " || " ${rhel_install_list[*]} " =~ " qrencode " ]] && ! rpm -q epel-release &>/dev/null && [[ "$OS_VERSION" =~ ^[789] ]]; then
+                echo_info "EPEL likely needed. Installing epel-release..."
+                sudo yum install -y epel-release
             fi
+            echo_info "Running yum makecache..."
+            sudo yum makecache
+            echo_info "Attempting to install with yum: ${rhel_install_list[*]}"
+            if ! sudo yum install -y "${rhel_install_list[@]}"; then
+                echo_error "Failed with yum: ${rhel_install_list[*]}"
+            else echo_success "Yum install attempt finished for: ${rhel_install_list[*]}"; fi
         else
-            echo_error "Unsupported OS for automatic dependency installation: ${OS_RELEASE}"
-            echo_warning "Please install the following dependencies/commands manually: ${missing_deps[*]}"
-            exit 1
+            echo_error "Unsupported OS for auto-dependency install: ${OS_RELEASE}"
         fi
 
-        # Re-check after attempting installation
-        local still_missing_commands=()
-        for dep_pkg_name in "${dependencies[@]}"; do
-            local cmd_to_check="$dep_pkg_name"
-            if [[ "$dep_pkg_name" == "uuid-runtime" ]]; then
-                cmd_to_check="uuidgen"
-            fi
-            if ! command -v "$cmd_to_check" &>/dev/null; then
-                still_missing_commands+=("$cmd_to_check (expected from $dep_pkg_name or equivalent)")
+        local still_missing_final=()
+        for dep_pkg_name_final in "${dependencies[@]}"; do
+            local cmd_to_check_final="$dep_pkg_name_final"
+            case "$dep_pkg_name_final" in
+                "uuid-runtime") cmd_to_check_final="uuidgen" ;;
+                "qrencode") cmd_to_check_final="qrencode" ;;
+            esac
+            if ! command -v "$cmd_to_check_final" &>/dev/null; then
+                still_missing_final+=("$cmd_to_check_final (from $dep_pkg_name_final or equivalent)")
             fi
         done
-
-        if [[ ${#still_missing_commands[@]} -gt 0 ]]; then
-            echo_error "Critical commands still missing after installation attempt: ${still_missing_commands[*]}"
-            echo_error "Please ensure these commands are available and re-run the script."
+        if [[ ${#still_missing_final[@]} -gt 0 ]]; then
+            echo_error "Critical commands still missing: ${still_missing_final[*]}. Please install manually."
             exit 1
         fi
-        echo_success "All required dependencies appear to be installed and commands available."
+        echo_success "Dependency check passed after installation attempt."
     else
-        echo_success "All required dependencies are already installed and commands available."
+        echo_success "All required dependencies are already installed."
     fi
 }
 
-
-# Pause
-press_to_continue() {
-    echo_info "Press Enter to continue..."
-    read -r
-}
-
-# Function to check architecture for cloudflared
+# --- Cloudflare Tunnel Functions ---
 check_cloudflared_arch() {
     case $(uname -m) in
     i386 | i686) ARCH_CLOUDFLARED="386" ;;
     x86_64 | amd64) ARCH_CLOUDFLARED="amd64" ;;
     armv5tel | armv6l | armv7l | armv8l) ARCH_CLOUDFLARED="arm" ;;
     aarch64 | arm64) ARCH_CLOUDFLARED="arm64" ;;
-    *)
-        echo_error "Unsupported architecture for Cloudflared: $(uname -m)"
-        return 1
-        ;;
+    *) echo_error "Unsupported architecture for Cloudflared: $(uname -m)"; return 1 ;;
     esac
     return 0
 }
 
-# Function to install cloudflared executable
 install_cloudflared_executable() {
     echo_info "Detecting architecture for Cloudflared..."
-    if ! check_cloudflared_arch; then
-        return 1
-    fi
-
+    check_cloudflared_arch || return 1
     echo_info "Downloading Cloudflared for ${ARCH_CLOUDFLARED} architecture..."
     local download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH_CLOUDFLARED}"
-
+    
     if command -v curl >/dev/null 2>&1; then
-        if curl -Lso "${CLOUDFLARED_BIN}" "${download_url}"; then
-            echo_success "Cloudflared downloaded via curl."
-        else
-            echo_error "Download failed using curl. Please check your network or the URL: ${download_url}"
-            return 1
-        fi
+        curl -Lso "${CLOUDFLARED_BIN}" "${download_url}" || { echo_error "Curl download failed: ${download_url}"; return 1; }
     elif command -v wget >/dev/null 2>&1; then
-        if wget -qO "${CLOUDFLARED_BIN}" "${download_url}"; then
-            echo_success "Cloudflared downloaded via wget."
-        else
-            echo_error "Download failed using wget. Please check your network or the URL: ${download_url}"
-            return 1
-        fi
-    else
-        echo_error "Neither curl nor wget is installed. Please install one of them."
-        return 1
-    fi
+        wget -qO "${CLOUDFLARED_BIN}" "${download_url}" || { echo_error "Wget download failed: ${download_url}"; return 1; }
+    else echo_error "Neither curl nor wget found."; return 1; fi
 
-    if [[ ! -f "${CLOUDFLARED_BIN}" ]]; then
-        echo_error "Cloudflared binary not found after download attempt."
-        return 1
-    fi
-
+    [[ ! -f "${CLOUDFLARED_BIN}" ]] && { echo_error "Cloudflared binary not found after download."; return 1; }
     chmod +x "${CLOUDFLARED_BIN}"
-    echo_success "Cloudflared binary downloaded and made executable at ${CLOUDFLARED_BIN}"
+    echo_success "Cloudflared binary at ${CLOUDFLARED_BIN}"
     return 0
 }
 
-# Function to get Sing-box listening port
-get_singbox_listen_port() {
-    local info_file="${SING_BOX_INFO_PATH}info.json"
-    local config_file="${SING_BOX_CONFIG_PATH}config.json"
+get_singbox_listen_port_for_tunnel() {
     local port=""
-
-    if [[ -f "$info_file" ]]; then
-        port=$(jq -r '.reality_listen_port // .listen_port // .inbounds[0].listen_port // ""' "$info_file" 2>/dev/null)
-        if [[ -n "$port" && "$port" != "null" && "$port" != "" ]]; then
-            echo "$port"
-            return 0
-        fi
+    if [[ -f "$SING_BOX_USER_INFO_FILE" ]]; then # Check info file first
+        port=$(jq -r '.listen_port // .reality_listen_port // ""' "$SING_BOX_USER_INFO_FILE" 2>/dev/null)
+        [[ -n "$port" && "$port" != "null" ]] && { echo "$port"; return 0; }
     fi
-
-    if [[ -f "$config_file" ]]; then
-        port=$(jq -r '
-            .inbounds[] |
-            select(.type=="vmess" or .type=="vless" or .type=="trojan" or .type=="shadowsocks" or .type=="hysteria2" or .type=="tuic" or .type=="mixed") |
-            .listen_port |
-            select(. != null) |
-            tostring' "$config_file" | head -n 1)
-
-        if [[ -n "$port" && "$port" != "null" && "$port" != "" ]]; then
-            echo_info "Found port $port from a primary inbound in $config_file."
-            echo "$port"
-            return 0
-        fi
-        port=$(jq -r '.inbounds[0].listen_port // ""' "$config_file" 2>/dev/null)
-         if [[ -n "$port" && "$port" != "null" && "$port" != "" ]]; then
-            echo_info "Found port $port from the first inbound in $config_file."
-            echo "$port"
-            return 0
-        fi
+    if [[ -f "$SING_BOX_CONFIG_FILE" ]]; then # Fallback to main config
+        port=$(jq -r '.inbounds[] | select(.type=="vmess" or .type=="vless" or .type=="trojan" or .type=="shadowsocks" or .type=="hysteria2" or .type=="tuic" or .type=="mixed") | .listen_port | select(. != null) | tostring' "$SING_BOX_CONFIG_FILE" | head -n 1)
+        [[ -n "$port" && "$port" != "null" ]] && { echo_info "Found port $port from main config."; echo "$port"; return 0; }
+        port=$(jq -r '.inbounds[0].listen_port // ""' "$SING_BOX_CONFIG_FILE" 2>/dev/null) # Absolute fallback to first inbound
+        [[ -n "$port" && "$port" != "null" ]] && { echo_info "Found port $port from first inbound in main config."; echo "$port"; return 0; }
     fi
-
-    echo_warning "Could not automatically determine Sing-box listening port."
-    read -rp "Please enter the Sing-box listening port you want to tunnel (e.g., 443, 8080, 2053): " manual_port
-    if [[ "$manual_port" =~ ^[0-9]+$ && "$manual_port" -gt 0 && "$manual_port" -le 65535 ]]; then
-        echo "$manual_port"
-        return 0
-    else
-        echo_error "Invalid port entered: $manual_port"
-        return 1
-    fi
+    echo_warning "Could not auto-determine Sing-box port for tunnel."
+    read -rp "Enter Sing-box listening port for tunnel (e.g., 443, 2053): " manual_port
+    [[ "$manual_port" =~ ^[0-9]+$ && "$manual_port" -gt 0 && "$manual_port" -le 65535 ]] && { echo "$manual_port"; return 0; } || { echo_error "Invalid port: $manual_port"; return 1; }
 }
 
-# Function to install Cloudflare Tunnel service
 install_cloudflare_tunnel_service() {
     check_root
-    if [[ ! -f "${SING_BOX_CONFIG_PATH}config.json" ]]; then
-        echo_error "Sing-box does not appear to be installed. Please install Sing-box first."
-        press_to_continue
-        return 1
-    fi
+    [[ ! -f "${SING_BOX_CONFIG_FILE}" ]] && { echo_error "Sing-box not installed. Install it first."; press_to_continue; return 1; }
 
     if [[ -f "$CLOUDFLARED_BIN" ]]; then
-        echo_warning "Cloudflared executable already exists at ${CLOUDFLARED_BIN}."
-        read -rp "Skip downloading and proceed with service setup? (Y/n): " skip_download
-        skip_download=${skip_download:-Y}
-        if [[ "${skip_download,,}" == "n" ]]; then
-            read -rp "Re-download and overwrite ${CLOUDFLARED_BIN}? (y/N): " overwrite_cf
-            overwrite_cf=${overwrite_cf:-N}
-            if [[ "${overwrite_cf,,}" == "y" ]]; then
-                 sudo rm -f "${CLOUDFLARED_BIN}"
-                 install_cloudflared_executable || return 1
-            else
-                echo_info "Using existing Cloudflared binary."
-            fi
-        else
-             echo_info "Using existing Cloudflared binary."
+        echo_warning "${CLOUDFLARED_BIN} exists."
+        read -rp "Skip download & proceed with service setup? (Y/n): " skip_dl; skip_dl=${skip_dl:-Y}
+        if [[ "${skip_dl,,}" == "n" ]]; then
+            read -rp "Re-download & overwrite ${CLOUDFLARED_BIN}? (y/N): " overwrite_cf; overwrite_cf=${overwrite_cf:-N}
+            [[ "${overwrite_cf,,}" == "y" ]] && { sudo rm -f "${CLOUDFLARED_BIN}"; install_cloudflared_executable || return 1; }
         fi
-    else
-        install_cloudflared_executable || return 1
-    fi
+    else install_cloudflared_executable || return 1; fi
 
     if systemctl list-unit-files | grep -q "^${CLOUDFLARED_SERVICE_NAME}.service"; then
-        echo_warning "Cloudflared service seems to be already installed."
-        read -rp "Uninstall the existing service and reinstall? (y/N): " reinstall_service
-        reinstall_service=${reinstall_service:-N}
-        if [[ "${reinstall_service,,}" == "y" ]]; then
-            echo_info "Stopping and uninstalling existing Cloudflared service..."
+        echo_warning "Cloudflared service already installed."
+        read -rp "Uninstall existing and reinstall? (y/N): " reinstall_svc; reinstall_svc=${reinstall_svc:-N}
+        if [[ "${reinstall_svc,,}" == "y" ]]; then
+            echo_info "Uninstalling existing Cloudflared service..."
             sudo systemctl stop "${CLOUDFLARED_SERVICE_NAME}" >/dev/null 2>&1
             sudo "${CLOUDFLARED_BIN}" service uninstall >/dev/null 2>&1
-            sudo rm -f "/etc/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service"
-            sudo rm -f "/lib/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service"
+            sudo rm -f "/etc/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service" "/lib/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service"
             sudo systemctl daemon-reload
-            echo_success "Existing Cloudflared service uninstalled."
-        else
-            echo_info "Skipping Cloudflared service reinstallation. You can manage the existing service from the menu."
-            return 0
-        fi
+            echo_success "Existing service uninstalled."
+        else echo_info "Skipping reinstallation."; return 0; fi
     fi
 
-    local singbox_port
-    singbox_port=$(get_singbox_listen_port)
-    if [[ $? -ne 0 || -z "$singbox_port" ]]; then
-        echo_error "Failed to get Sing-box port. Aborting tunnel setup."
-        press_to_continue
-        return 1
-    fi
-    echo_info "Sing-box is detected/configured to be listening on port: ${YELLOW}${singbox_port}${PLAIN}"
+    local tunnel_sb_port; tunnel_sb_port=$(get_singbox_listen_port_for_tunnel)
+    [[ $? -ne 0 || -z "$tunnel_sb_port" ]] && { echo_error "Failed to get Sing-box port. Aborting."; press_to_continue; return 1; }
+    echo_info "Sing-box port for tunnel: ${YELLOW}${tunnel_sb_port}${PLAIN}"
 
     echo_line
-    echo_info "You need a Cloudflare Tunnel Token to proceed."
-    echo_info "1. Go to Cloudflare Zero Trust Dashboard: ${GREEN}https://one.dash.cloudflare.com/${PLAIN}"
-    echo_info "2. Navigate to ${YELLOW}Access -> Tunnels${PLAIN}."
-    echo_info "3. Click '${BLUE}Create a tunnel${PLAIN}', choose '${CYAN}Cloudflared${PLAIN}' connector type."
-    echo_info "4. Give your tunnel a name (e.g., singbox-server) and click '${BLUE}Save tunnel${PLAIN}'."
-    echo_info "5. On the next page ('Install connector'), select your OS (e.g., Linux -> Debian/Ubuntu, 64-bit)."
-    echo_info "6. ${RED}COPY THE TOKEN${PLAIN} from the command shown (it's the long string after 'cloudflared service install ...')."
+    echo_info "Get Cloudflare Tunnel Token:"
+    echo_info "1. Go to Cloudflare Zero Trust: ${GREEN}https://one.dash.cloudflare.com/${PLAIN}"
+    echo_info "2. ${YELLOW}Access -> Tunnels${PLAIN} -> ${BLUE}Create a tunnel${PLAIN} -> Type: ${CYAN}Cloudflared${PLAIN}"
+    echo_info "3. Name tunnel (e.g., singbox-server) -> ${BLUE}Save tunnel${PLAIN}"
+    echo_info "4. Choose OS (e.g., Linux -> Debian/Ubuntu, 64-bit)"
+    echo_info "5. ${RED}COPY THE TOKEN${PLAIN} from 'cloudflared service install TOKEN_HERE'"
     echo_line
-    read -rp "Paste your Cloudflare Tunnel Token here: " cf_token
-    if [[ -z "$cf_token" ]]; then
-        echo_error "No token provided. Aborting."
-        press_to_continue
-        return 1
-    fi
+    read -rp "Paste Cloudflare Tunnel Token: " cf_token
+    [[ -z "$cf_token" ]] && { echo_error "No token. Aborting."; press_to_continue; return 1; }
 
     echo_info "Installing Cloudflared service with token..."
     if sudo "${CLOUDFLARED_BIN}" service install "${cf_token}"; then
-        echo_success "Cloudflared service installed successfully."
-        sudo systemctl enable "${CLOUDFLARED_SERVICE_NAME}" >/dev/null 2>&1
-        sudo systemctl start "${CLOUDFLARED_SERVICE_NAME}"
-        
-        echo_info "Waiting a few seconds for the tunnel to establish..."
-        sleep 5 
-        
+        echo_success "Cloudflared service installed."
+        sudo systemctl enable "${CLOUDFLARED_SERVICE_NAME}" --now >/dev/null 2>&1
+        echo_info "Waiting for tunnel to establish..." && sleep 5
         echo_line
-        echo_success "Cloudflare Tunnel service is set up."
-        echo_info "${RED}IMPORTANT NEXT STEPS IN CLOUDFLARE DASHBOARD:${PLAIN}"
-        echo_info "1. Go back to your tunnel in ${YELLOW}Access -> Tunnels${PLAIN} in the Cloudflare dashboard."
-        echo_info "   (The tunnel might take a moment to show as 'Healthy')."
-        echo_info "2. Click '${BLUE}Configure${PLAIN}' for your tunnel."
-        echo_info "3. Go to the '${CYAN}Public Hostnames${PLAIN}' tab."
-        echo_info "4. Click '${BLUE}Add a public hostname${PLAIN}'."
-        echo_info "   - ${YELLOW}Subdomain:${PLAIN} (e.g., mysb, vpn) Your chosen prefix."
-        echo_info "   - ${YELLOW}Domain:${PLAIN}    Select your domain from the dropdown."
-        echo_info "   - ${YELLOW}Path:${PLAIN}      (Leave empty if Sing-box handles paths, or specify if needed, e.g., /vless)"
-        echo_info "   - ${YELLOW}Service Type:${PLAIN} Select ${GREEN}HTTP${PLAIN} (Usually. Cloudflare handles external HTTPS)."
-        echo_info "   - ${YELLOW}Service URL:${PLAIN}  ${GREEN}localhost:${singbox_port}${PLAIN} (or http://localhost:${singbox_port})"
-        echo_info "   - Under 'Additional application settings' -> 'TLS', you can optionally enable '${CYAN}No TLS Verify${PLAIN}' "
-        echo_info "     if your local Sing-box service uses a self-signed cert AND you chose HTTPS type (not common for this default setup)."
-        echo_info "5. Click '${BLUE}Save hostname${PLAIN}'."
-        echo_line
-        echo_info "Cloudflare will automatically create a CNAME record for this hostname pointing to your tunnel."
-        echo_info "Your Sing-box should then be accessible via ${GREEN}https://<your_chosen_subdomain>.<your_domain>${PLAIN}"
-        echo_info "(Cloudflare provides the HTTPS certificate for your public hostname)."
-        echo_line
-        echo_info "You can check the status with: ${CYAN}systemctl status ${CLOUDFLARED_SERVICE_NAME}${PLAIN}"
-        echo_info "And logs with: ${CYAN}journalctl -u ${CLOUDFLARED_SERVICE_NAME} -f${PLAIN}"
+        echo_success "Cloudflare Tunnel service setup."
+        echo_info "${RED}NEXT STEPS IN CLOUDFLARE DASHBOARD:${PLAIN}"
+        echo_info "1. Back in Tunnels, ${BLUE}Configure${PLAIN} your tunnel."
+        echo_info "2. Tab ${CYAN}Public Hostnames${PLAIN} -> ${BLUE}Add a public hostname${PLAIN}"
+        echo_info "   - Subdomain: (e.g., mysb), Domain: (your domain)"
+        echo_info "   - Path: (empty or specific, e.g. /vless)"
+        echo_info "   - Service Type: ${GREEN}HTTP${PLAIN}, URL: ${GREEN}localhost:${tunnel_sb_port}${PLAIN}"
+        echo_info "   - (Optional) Additional settings -> TLS -> No TLS Verify (if local Sing-box uses self-signed HTTPS)"
+        echo_info "3. ${BLUE}Save hostname${PLAIN}."
+        echo_info "Access via ${GREEN}https://<subdomain>.<domain>/<path>${PLAIN}"
+        echo_info "Status: ${CYAN}systemctl status ${CLOUDFLARED_SERVICE_NAME}${PLAIN}, Logs: ${CYAN}journalctl -u ${CLOUDFLARED_SERVICE_NAME} -f${PLAIN}"
     else
-        echo_error "Cloudflared service installation failed. Check logs above."
-        echo_error "You might need to run: journalctl -u ${CLOUDFLARED_SERVICE_NAME} or check system logs."
-        echo_error "Ensure the token was correct and that ${CLOUDFLARED_BIN} has execute permissions."
+        echo_error "Cloudflared service install failed. Check logs."
+        echo_error "Try: journalctl -u ${CLOUDFLARED_SERVICE_NAME}"
     fi
     press_to_continue
 }
 
-# Function to uninstall Cloudflare Tunnel service
 uninstall_cloudflare_tunnel_service() {
     check_root
-    echo_info "Attempting to uninstall Cloudflare Tunnel..."
-
+    echo_info "Uninstalling Cloudflare Tunnel..."
     if systemctl list-unit-files | grep -q "^${CLOUDFLARED_SERVICE_NAME}.service"; then
-        echo_info "Stopping Cloudflared service..."
         sudo systemctl stop "${CLOUDFLARED_SERVICE_NAME}"
-        echo_info "Disabling Cloudflared service..."
         sudo systemctl disable "${CLOUDFLARED_SERVICE_NAME}" >/dev/null 2>&1
-        
-        if [[ -f "$CLOUDFLARED_BIN" ]]; then
-            echo_info "Uninstalling service using ${CLOUDFLARED_BIN}..."
-            sudo "${CLOUDFLARED_BIN}" service uninstall # This should clean up systemd entries
-        else
-            echo_warning "${CLOUDFLARED_BIN} not found. Manually removing systemd files if they exist."
-        fi
-        sudo rm -f "/etc/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service"
-        sudo rm -f "/lib/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service"
+        [[ -f "$CLOUDFLARED_BIN" ]] && sudo "${CLOUDFLARED_BIN}" service uninstall
+        sudo rm -f "/etc/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service" "/lib/systemd/system/${CLOUDFLARED_SERVICE_NAME}.service"
         sudo systemctl daemon-reload
         echo_success "Cloudflared service uninstalled."
-    else
-        echo_info "Cloudflared service does not appear to be installed."
-    fi
+    else echo_info "Cloudflared service not installed."; fi
 
-    if [[ -f "$CLOUDFLARED_BIN" ]]; then
-        read -rp "Do you want to remove the Cloudflared executable (${CLOUDFLARED_BIN})? (y/N): " remove_bin
-        remove_bin=${remove_bin:-N}
-        if [[ "${remove_bin,,}" == "y" ]]; then
-            sudo rm -f "${CLOUDFLARED_BIN}"
-            echo_success "Cloudflared executable removed."
-        fi
-    fi
+    read -rp "Remove ${CLOUDFLARED_BIN} executable? (y/N): " rm_bin; rm_bin=${rm_bin:-N}
+    [[ "${rm_bin,,}" == "y" && -f "$CLOUDFLARED_BIN" ]] && sudo rm -f "${CLOUDFLARED_BIN}" && echo_success "Executable removed."
 
-    read -rp "Do you want to remove Cloudflared configuration files (${CLOUDFLARED_CONFIG_DIR}, /root/.cloudflared)? (y/N): " remove_configs
-    remove_configs=${remove_configs:-N}
-    if [[ "${remove_configs,,}" == "y" ]]; then
-        sudo rm -rf "${CLOUDFLARED_CONFIG_DIR}"
-        sudo rm -rf "/root/.cloudflared" # Credentials and cert.pem are often here
-        echo_success "Cloudflared configuration files removed."
+    read -rp "Remove configs (${CLOUDFLARED_CONFIG_DIR}, /root/.cloudflared)? (y/N): " rm_cfg; rm_cfg=${rm_cfg:-N}
+    if [[ "${rm_cfg,,}" == "y" ]]; then
+        sudo rm -rf "${CLOUDFLARED_CONFIG_DIR}" "/root/.cloudflared"
+        echo_success "Configs removed."
     fi
-    
-    echo_info "Cloudflare Tunnel uninstallation process complete."
-    echo_warning "You may also want to delete the tunnel from your Cloudflare Zero Trust dashboard."
+    echo_info "Uninstallation complete. Delete tunnel from Cloudflare dashboard if needed."
     press_to_continue
 }
 
-
-# Manage Cloudflare Tunnel Menu
 manage_cloudflare_tunnel() {
     clear
-    echo_line
-    echo_color "${GREEN}" "Cloudflare Tunnel Management"
-    echo_color "${CYAN}" "------------------------------------"
-    echo -e "  ${GREEN}1.${PLAIN} Install Cloudflare Tunnel Service"
-    echo -e "  ${GREEN}2.${PLAIN} Uninstall Cloudflare Tunnel Service"
-    echo -e "  ${GREEN}3.${PLAIN} Start Cloudflare Tunnel Service"
-    echo -e "  ${GREEN}4.${PLAIN} Stop Cloudflare Tunnel Service"
-    echo -e "  ${GREEN}5.${PLAIN} Restart Cloudflare Tunnel Service"
-    echo -e "  ${GREEN}6.${PLAIN} View Cloudflare Tunnel Status"
-    echo -e "  ${GREEN}7.${PLAIN} View Cloudflare Tunnel Logs"
-    echo -e "  ${GREEN}0.${PLAIN} Back to Main Menu"
-    echo_color "${CYAN}" "------------------------------------"
-    read -rp "Please enter your choice [0-7]: " sub_choice
+    echo_line; echo_color "${GREEN}" "Cloudflare Tunnel Management"; echo_color "${CYAN}" "---"
+    echo -e "  ${GREEN}1.${PLAIN} Install Tunnel Service"; echo -e "  ${GREEN}2.${PLAIN} Uninstall Tunnel Service"
+    echo -e "  ${GREEN}3.${PLAIN} Start Tunnel"; echo -e "  ${GREEN}4.${PLAIN} Stop Tunnel"; echo -e "  ${GREEN}5.${PLAIN} Restart Tunnel"
+    echo -e "  ${GREEN}6.${PLAIN} Tunnel Status"; echo -e "  ${GREEN}7.${PLAIN} Tunnel Logs"; echo -e "  ${GREEN}0.${PLAIN} Back to Main Menu"
+    echo_color "${CYAN}" "---"; read -rp "Choice [0-7]: " choice
 
-    local service_exists=false
-    if systemctl list-unit-files | grep -q "^${CLOUDFLARED_SERVICE_NAME}.service"; then
-        service_exists=true
-    fi
-
-    case "$sub_choice" in
-    1)
-        install_cloudflare_tunnel_service
-        ;;
-    2)
-        uninstall_cloudflare_tunnel_service
-        ;;
-    3)
-        if $service_exists; then
-            sudo systemctl start "${CLOUDFLARED_SERVICE_NAME}" && echo_success "Cloudflared service started." || echo_error "Failed to start Cloudflared service."
-        else
-            echo_error "Cloudflared service is not installed."
-        fi
+    local svc_exists; svc_exists=$(systemctl list-unit-files | grep -q "^${CLOUDFLARED_SERVICE_NAME}.service" && echo true || echo false)
+    handle_svc_action() {
+        $svc_exists && { sudo systemctl "$1" "${CLOUDFLARED_SERVICE_NAME}" && echo_success "Service $1 successful." || echo_error "Service $1 failed."; } || echo_error "Service not installed."
         press_to_continue
-        ;;
-    4)
-        if $service_exists; then
-            sudo systemctl stop "${CLOUDFLARED_SERVICE_NAME}" && echo_success "Cloudflared service stopped." || echo_error "Failed to stop Cloudflared service."
-        else
-            echo_error "Cloudflared service is not installed."
-        fi
-        press_to_continue
-        ;;
-    5)
-        if $service_exists; then
-            sudo systemctl restart "${CLOUDFLARED_SERVICE_NAME}" && echo_success "Cloudflared service restarted." || echo_error "Failed to restart Cloudflared service."
-        else
-            echo_error "Cloudflared service is not installed."
-        fi
-        press_to_continue
-        ;;
-    6)
-        if $service_exists; then
-            sudo systemctl status "${CLOUDFLARED_SERVICE_NAME}" --no-pager
-        else
-            echo_error "Cloudflared service is not installed."
-        fi
-        press_to_continue
-        ;;
-    7)
-        if $service_exists; then
-            echo_info "Displaying logs for ${CLOUDFLARED_SERVICE_NAME}. Press Ctrl+C to exit."
-            sudo journalctl -u "${CLOUDFLARED_SERVICE_NAME}" -f --no-pager
-        else
-            echo_error "Cloudflared service is not installed."
-        fi
-        # No press_to_continue here as journalctl -f needs to be exited manually
-        ;;
-    0)
-        return
-        ;;
-    *)
-        echo_error "Invalid choice."
-        press_to_continue
-        ;;
+    }
+    case "$choice" in
+        1) install_cloudflare_tunnel_service ;;
+        2) uninstall_cloudflare_tunnel_service ;;
+        3) handle_svc_action "start" ;;
+        4) handle_svc_action "stop" ;;
+        5) handle_svc_action "restart" ;;
+        6) $svc_exists && sudo systemctl status "${CLOUDFLARED_SERVICE_NAME}" --no-pager || echo_error "Service not installed."; press_to_continue ;;
+        7) $svc_exists && { echo_info "Logs for ${CLOUDFLARED_SERVICE_NAME}. Ctrl+C to exit."; sudo journalctl -u "${CLOUDFLARED_SERVICE_NAME}" -f --no-pager; } || echo_error "Service not installed." ;; # No press_to_continue
+        0) return ;;
+        *) echo_error "Invalid choice."; press_to_continue ;;
     esac
-    # Loop back to cloudflare menu if not returning to main
-    if [[ "$sub_choice" != "0" ]]; then
-        manage_cloudflare_tunnel
-    fi
+    [[ "$choice" != "0" && "$choice" != "7" ]] && manage_cloudflare_tunnel # Loop back unless returning or viewing logs
+    [[ "$choice" == "7" ]] && press_to_continue && manage_cloudflare_tunnel # Loop back for logs after manual exit from logs
 }
 
-# Placeholder for existing sing-box functions (from original sb.sh)
-# These functions MUST be properly defined in the actual script you use.
-# For brevity, I'm not re-listing all of them. Ensure they are present.
-# --- BEGINNING OF PLACEHOLDER SING-BOX FUNCTIONS ---
-install_sing_box() { echo_warning "Function 'install_sing_box' is a placeholder. Implement or merge from original script."; press_to_continue; }
-uninstall_sing_box() { echo_warning "Function 'uninstall_sing_box' is a placeholder. Implement or merge from original script."; press_to_continue; }
-manage_sing_box_service() { echo_warning "Function 'manage_sing_box_service' is a placeholder. Implement or merge from original script."; press_to_continue; }
-manage_sing_box_config() { echo_warning "Function 'manage_sing_box_config' is a placeholder. Implement or merge from original script."; press_to_continue; }
-manage_users() { echo_warning "Function 'manage_users' is a placeholder. Implement or merge from original script."; press_to_continue; }
-generate_client_config() { echo_warning "Function 'generate_client_config' is a placeholder. Implement or merge from original script."; press_to_continue; }
-view_logs() { echo_warning "Function 'view_logs' is a placeholder. Implement or merge from original script."; press_to_continue; }
-update_script() {
+
+# --- Sing-box Core Functions (Merged from frank-cn-2000/sing-box-yg/sb.sh) ---
+
+# Function to check if Sing-box is installed
+is_sing_box_installed() {
+    [[ -f "${SING_BOX_BIN_PATH}" && -f "${SING_BOX_CONFIG_FILE}" && -f "${SING_BOX_SERVICE_FILE}" ]]
+}
+
+# Install Sing-box
+install_sing_box() {
+    echo_info "Starting Sing-box installation..."
+    if is_sing_box_installed; then
+        echo_warning "Sing-box already installed. For reinstallation, uninstall first."
+        press_to_continue
+        return
+    fi
+
+    # Download and install Sing-box binary
+    echo_info "Downloading Sing-box core for ${SING_BOX_ARCH}..."
+    local latest_version; latest_version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+    if [[ -z "$latest_version" ]]; then
+        echo_error "Failed to fetch latest Sing-box version. Check network or GitHub API."
+        press_to_continue
+        return
+    fi
+    echo_info "Latest Sing-box version: ${latest_version}"
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/${latest_version}/sing-box-${latest_version_no_v#v}-linux-${SING_BOX_ARCH}.tar.gz"
+    latest_version_no_v="${latest_version#v}" # remove 'v' prefix if present
+    download_url="https://github.com/SagerNet/sing-box/releases/download/${latest_version}/sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}.tar.gz"
+
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -Lso "/tmp/sing-box.tar.gz" "$download_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "/tmp/sing-box.tar.gz" "$download_url"
+    else
+        echo_error "Neither curl nor wget found for downloading."
+        press_to_continue
+        return
+    fi
+
+    if [[ ! -s "/tmp/sing-box.tar.gz" ]]; then # Check if file is not empty
+        echo_error "Failed to download Sing-box archive or archive is empty."
+        rm -f "/tmp/sing-box.tar.gz"
+        press_to_continue
+        return
+    fi
+
+    sudo tar -xzf "/tmp/sing-box.tar.gz" -C "/tmp/"
+    # The extracted folder name is sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}
+    sudo mv "/tmp/sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}/sing-box" "${SING_BOX_BIN_PATH}"
+    sudo chmod +x "${SING_BOX_BIN_PATH}"
+    sudo rm -rf "/tmp/sing-box.tar.gz" "/tmp/sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}"
+    echo_success "Sing-box binary installed at ${SING_BOX_BIN_PATH}"
+
+    # Create config directory
+    sudo mkdir -p "${SING_BOX_CONFIG_PATH_DIR}"
+    sudo mkdir -p "${SING_BOX_INFO_PATH_DIR}" # For user info file
+
+    # Create default config (basic structure)
+    if [[ ! -f "${SING_BOX_CONFIG_FILE}" ]]; then
+        echo_info "Creating default config file..."
+        cat <<EOF | sudo tee "${SING_BOX_CONFIG_FILE}" > /dev/null
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ]
+}
+EOF
+        echo_success "Default config created at ${SING_BOX_CONFIG_FILE}"
+    fi
+    
+    # Create service file
+    if [[ ! -f "${SING_BOX_SERVICE_FILE}" ]]; then
+        echo_info "Creating systemd service file..."
+        cat <<EOF | sudo tee "${SING_BOX_SERVICE_FILE}" > /dev/null
+[Unit]
+Description=Sing-box Service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+WorkingDirectory=${SING_BOX_CONFIG_PATH_DIR}
+ExecStart=${SING_BOX_BIN_PATH} run -c ${SING_BOX_CONFIG_FILE}
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable sing-box
+        echo_success "Systemd service created and enabled."
+    fi
+
+    echo_success "Sing-box installation complete."
+    echo_info "You may need to configure inbounds and users now."
+    press_to_continue
+}
+
+# Uninstall Sing-box
+uninstall_sing_box() {
+    echo_warning "This will uninstall Sing-box and remove all its configurations!"
+    read -rp "Are you sure you want to continue? (y/N): " confirm
+    confirm=${confirm:-N}
+    if [[ "${confirm,,}" != "y" ]]; then
+        echo_info "Uninstallation cancelled."
+        press_to_continue
+        return
+    fi
+
+    sudo systemctl stop sing-box >/dev/null 2>&1
+    sudo systemctl disable sing-box >/dev/null 2>&1
+    sudo rm -f "${SING_BOX_SERVICE_FILE}"
+    sudo systemctl daemon-reload
+
+    sudo rm -f "${SING_BOX_BIN_PATH}"
+    sudo rm -rf "${SING_BOX_CONFIG_PATH_DIR}" # Removes config.json and other potential files
+    sudo rm -rf "${SING_BOX_INFO_PATH_DIR}"   # Removes info.json
+    sudo rm -f "${SING_BOX_LOG_FILE}"
+
+    echo_success "Sing-box uninstalled successfully."
+    press_to_continue
+}
+
+# Manage Sing-box Service (start, stop, restart, status)
+manage_sing_box_service() {
+    if ! is_sing_box_installed; then
+        echo_error "Sing-box is not installed."
+        press_to_continue
+        return
+    fi
+    clear
+    echo_color "${GREEN}" "Manage Sing-box Service"; echo_line
+    echo -e "  ${GREEN}1.${PLAIN} Start Sing-box"
+    echo -e "  ${GREEN}2.${PLAIN} Stop Sing-box"
+    echo -e "  ${GREEN}3.${PLAIN} Restart Sing-box"
+    echo -e "  ${GREEN}4.${PLAIN} View Sing-box Status"
+    echo -e "  ${GREEN}0.${PLAIN} Back to Main Menu"; echo_line
+    read -rp "Enter your choice [0-4]: " choice
+
+    case "$choice" in
+        1) sudo systemctl start sing-box && echo_success "Sing-box started." || echo_error "Failed to start Sing-box." ;;
+        2) sudo systemctl stop sing-box && echo_success "Sing-box stopped." || echo_error "Failed to stop Sing-box." ;;
+        3) sudo systemctl restart sing-box && echo_success "Sing-box restarted." || echo_error "Failed to restart Sing-box." ;;
+        4) sudo systemctl status sing-box --no-pager ;;
+        0) return ;;
+        *) echo_error "Invalid choice." ;;
+    esac
+    press_to_continue
+    manage_sing_box_service # Loop back
+}
+
+# View Sing-box Logs
+view_sing_box_logs() {
+    if ! is_sing_box_installed; then
+        echo_error "Sing-box is not installed."
+        press_to_continue
+        return
+    fi
+    echo_info "Displaying Sing-box logs (from journalctl). Press Ctrl+C to exit."
+    sudo journalctl -u sing-box -f --no-pager
+    # No press_to_continue, user exits manually
+}
+
+# Update Sing-box Core
+update_sing_box_core() {
+    if ! is_sing_box_installed; then
+        echo_error "Sing-box is not installed. Please install it first."
+        press_to_continue
+        return
+    fi
+    echo_info "Checking for Sing-box core updates..."
+    local current_version; current_version=$(${SING_BOX_BIN_PATH} version | head -n1 | awk '{print $3}')
+    local latest_version; latest_version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+    latest_version_no_v="${latest_version#v}" # remove 'v' prefix
+
+    if [[ -z "$latest_version" ]]; then
+        echo_error "Failed to fetch latest version from GitHub."
+        press_to_continue
+        return
+    fi
+
+    echo_info "Current version: ${current_version}"
+    echo_info "Latest version: ${latest_version_no_v}"
+
+    if [[ "$current_version" == "$latest_version_no_v" ]]; then
+        echo_success "You are already using the latest version of Sing-box."
+        press_to_continue
+        return
+    fi
+
+    read -rp "New version ${latest_version_no_v} available. Update now? (Y/n): " confirm_update
+    confirm_update=${confirm_update:-Y}
+    if [[ "${confirm_update,,}" != "y" ]]; then
+        echo_info "Update cancelled."
+        press_to_continue
+        return
+    fi
+
+    echo_info "Downloading Sing-box ${latest_version_no_v} for ${SING_BOX_ARCH}..."
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/${latest_version}/sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}.tar.gz"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -Lso "/tmp/sing-box-update.tar.gz" "$download_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "/tmp/sing-box-update.tar.gz" "$download_url"
+    else
+        echo_error "Neither curl nor wget found."; press_to_continue; return
+    fi
+
+    if [[ ! -s "/tmp/sing-box-update.tar.gz" ]]; then
+        echo_error "Download failed or archive is empty."; rm -f "/tmp/sing-box-update.tar.gz"; press_to_continue; return
+    fi
+
+    echo_info "Stopping Sing-box service..."
+    sudo systemctl stop sing-box
+
+    echo_info "Replacing binary..."
+    sudo tar -xzf "/tmp/sing-box-update.tar.gz" -C "/tmp/"
+    sudo mv "/tmp/sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}/sing-box" "${SING_BOX_BIN_PATH}"
+    sudo chmod +x "${SING_BOX_BIN_PATH}"
+    sudo rm -rf "/tmp/sing-box-update.tar.gz" "/tmp/sing-box-${latest_version_no_v}-linux-${SING_BOX_ARCH}"
+
+    echo_info "Starting Sing-box service..."
+    sudo systemctl start sing-box
+    echo_success "Sing-box updated to version $(${SING_BOX_BIN_PATH} version | head -n1 | awk '{print $3}')"
+    press_to_continue
+}
+
+# Update This Script (Logic from frank-cn-2000/sing-box-yg, needs URL adjustment for merged script)
+update_this_script() {
     echo_info "Checking for script updates..."
-    # Example update mechanism - adapt to your actual script source
-    local current_script_url="https://raw.githubusercontent.com/szgz/proxy/main/sb.sh" # Example URL
-    local temp_script="/tmp/sb_update.sh"
-    if curl -Lso "$temp_script" "$current_script_url"; then
+    # !!! IMPORTANT: This URL points to the original frank-cn-2000 script.
+    # !!! If you host this merged script elsewhere, change this URL.
+    local remote_script_url="https://raw.githubusercontent.com/frank-cn-2000/sing-box-yg/main/sb.sh"
+    # As an alternative, if you want to update from szgz/proxy (which only has the CF part)
+    # local remote_script_url="https://raw.githubusercontent.com/szgz/proxy/main/sb.sh" # This is likely NOT what you want for the full script
+    
+    echo_warning "Current update URL is: ${remote_script_url}"
+    echo_warning "This might revert to a different script version if you are using a custom merged script."
+    read -rp "Proceed with update check from this URL? (y/N): " proceed_update_check
+    proceed_update_check=${proceed_update_check:-N}
+    if [[ "${proceed_update_check,,}" != "y" ]]; then
+        echo_info "Script update check cancelled."
+        press_to_continue
+        return
+    fi
+
+    local temp_script_path="/tmp/sb_update_temp.sh"
+    if curl -Lso "$temp_script_path" "$remote_script_url"; then
         # Basic check: see if downloaded script is different and has a version string
-        if grep -q "VERSION=" "$temp_script" && ! cmp -s "$0" "$temp_script"; then
-            echo_success "New version found. Replacing current script."
-            # Make sure the new script is executable
-            chmod +x "$temp_script"
-            # Replace current script with the new one
-            if mv "$temp_script" "$0"; then
-                echo_success "Script updated successfully. Please re-run the script."
-                exit 0
+        # This version check is rudimentary and might not be perfectly accurate if versions are formatted differently.
+        local remote_version=$(grep -oP 'SCRIPT_VERSION="[^"]+"' "$temp_script_path" | grep -oP '"\K[^"]+')
+        if [[ -n "$remote_version" && "$remote_version" != "$SCRIPT_VERSION" ]]; then # A simple string comparison
+            echo_success "New version ${remote_version} found (current: ${SCRIPT_VERSION})."
+            read -rp "Do you want to update the script? (Y/n): " confirm_script_update
+            confirm_script_update=${confirm_script_update:-Y}
+            if [[ "${confirm_script_update,,}" == "y" ]]; then
+                chmod +x "$temp_script_path"
+                if sudo mv "$temp_script_path" "$0"; then # $0 is the path of the current script
+                    echo_success "Script updated successfully. Please re-run the script: sudo $0"
+                    exit 0
+                else
+                    echo_error "Failed to replace the script. Check permissions."
+                    sudo rm -f "$temp_script_path"
+                fi
             else
-                echo_error "Failed to replace the script. Check permissions."
-                rm -f "$temp_script"
+                 echo_info "Script update cancelled by user."
+                 sudo rm -f "$temp_script_path"
             fi
+        elif [[ -n "$remote_version" && "$remote_version" == "$SCRIPT_VERSION" ]]; then
+             echo_info "You are already using the latest version (${SCRIPT_VERSION}) from the checked URL."
+             sudo rm -f "$temp_script_path"
         else
-            echo_info "You are already using the latest version or the update check failed."
-            rm -f "$temp_script"
+            echo_warning "Could not determine remote version or downloaded script is not different."
+            echo_info "If you believe there's an update, check the URL manually: ${remote_script_url}"
+            sudo rm -f "$temp_script_path"
         fi
     else
-        echo_error "Failed to download the update script. Check network or URL."
+        echo_error "Failed to download the update script. Check network or URL: ${remote_script_url}"
     fi
     press_to_continue
 }
-update_sing_box_core() { echo_warning "Function 'update_sing_box_core' is a placeholder. Implement or merge from original script."; press_to_continue; }
-# --- END OF PLACEHOLDER SING-BOX FUNCTIONS ---
 
-# Main Menu
+
+# --- Sing-box Configuration & User Management Functions (Placeholders for frank-cn-2000 logic) ---
+# These are complex and involve deep interaction with config.json and info.json.
+# For now, I'll put basic placeholders. Merging them requires careful porting of jq logic.
+# THE FOLLOWING FUNCTIONS ARE HIGHLY SIMPLIFIED AND NEED THE FULL LOGIC FROM frank-cn-2000/sing-box-yg/sb.sh
+
+manage_sing_box_config() {
+    if ! is_sing_box_installed; then echo_error "Sing-box not installed."; press_to_continue; return; fi
+    echo_warning "Config management needs full merge from original frank-cn-2000 script."
+    echo_info "You can manually edit: sudo nano ${SING_BOX_CONFIG_FILE}"
+    echo_info "And user info (if used by config): sudo nano ${SING_BOX_USER_INFO_FILE}"
+    press_to_continue
+}
+
+manage_users() {
+    if ! is_sing_box_installed; then echo_error "Sing-box not installed."; press_to_continue; return; fi
+    echo_warning "User management needs full merge from original frank-cn-2000 script."
+    echo_info "This typically involves editing ${SING_BOX_CONFIG_FILE} and/or ${SING_BOX_USER_INFO_FILE}"
+    press_to_continue
+}
+
+generate_client_config() {
+    if ! is_sing_box_installed; then echo_error "Sing-box not installed."; press_to_continue; return; fi
+    echo_warning "Client config/QR generation needs full merge from original frank-cn-2000 script."
+    echo_info "This depends on your specific inbound configurations in ${SING_BOX_CONFIG_FILE}."
+    press_to_continue
+}
+
+# --- Main Menu ---
 main_menu() {
     clear
     echo_color "${YELLOW}" "=================================================================="
-    echo_color "${GREEN}"  " sing-box Multi-User Management Script  Version: ${VERSION}"
+    echo_color "${GREEN}"  " sing-box Management Script (Merged)  Version: ${SCRIPT_VERSION}"
     echo_color "${BLUE}"   " Script Date: ${SCRIPT_UPDATE_DATE}"
     echo_color "${YELLOW}" "=================================================================="
     echo_color "${CYAN}"   "Current system time: $(date +"%Y-%m-%d %H:%M:%S")"
@@ -601,12 +668,12 @@ main_menu() {
     echo -e "  ${GREEN}1.${PLAIN} Install Sing-box"
     echo -e "  ${GREEN}2.${PLAIN} Uninstall Sing-box"
     echo -e "  ${GREEN}3.${PLAIN} Manage Sing-box Service"
-    echo -e "  ${GREEN}4.${PLAIN} Manage Sing-box Configuration"
-    echo -e "  ${GREEN}5.${PLAIN} Manage Users (Placeholder)"
-    echo -e "  ${GREEN}6.${PLAIN} Generate Client Configuration / QR Code (Placeholder)"
-    echo -e "  ${GREEN}7.${PLAIN} View Sing-box Logs (Placeholder)"
-    echo -e "  ${GREEN}8.${PLAIN} Update Sing-box Core (Placeholder)"
-    echo -e "  ${GREEN}9.${PLAIN} Update This Script"
+    echo -e "  ${GREEN}4.${PLAIN} Manage Sing-box Configuration ${YELLOW}(Basic Placeholder)${PLAIN}"
+    echo -e "  ${GREEN}5.${PLAIN} Manage Users ${YELLOW}(Basic Placeholder)${PLAIN}"
+    echo -e "  ${GREEN}6.${PLAIN} Generate Client Config / QR Code ${YELLOW}(Basic Placeholder)${PLAIN}"
+    echo -e "  ${GREEN}7.${PLAIN} View Sing-box Logs"
+    echo -e "  ${GREEN}8.${PLAIN} Update Sing-box Core"
+    echo -e "  ${GREEN}9.${PLAIN} Update This Script ${YELLOW}(Check URL inside function!)${PLAIN}"
     echo -e "  ${GREEN}10.${PLAIN} Manage Cloudflare Tunnel ${RED}(New!)${PLAIN}"
     echo_line
     echo -e "  ${GREEN}0.${PLAIN} Exit Script"
@@ -617,35 +684,25 @@ main_menu() {
     1) install_sing_box ;;
     2) uninstall_sing_box ;;
     3) manage_sing_box_service ;;
-    4) manage_sing_box_config ;;
-    5) manage_users ;;
-    6) generate_client_config ;;
-    7) view_logs ;;
+    4) manage_sing_box_config ;;      # Placeholder
+    5) manage_users ;;                # Placeholder
+    6) generate_client_config ;;      # Placeholder
+    7) view_sing_box_logs ;;
     8) update_sing_box_core ;;
-    9) update_script ;;
+    9) update_this_script ;;
     10) manage_cloudflare_tunnel ;;
-    0)
-        echo_success "Exiting script. Goodbye!"
-        exit 0
-        ;;
-    *)
-        echo_error "Invalid choice, please try again."
-        press_to_continue
-        ;;
+    0) echo_success "Exiting script. Goodbye!"; exit 0 ;;
+    *) echo_error "Invalid choice, please try again."; press_to_continue ;;
     esac
-
-    # Loop back to main menu if not exiting
-    if [[ "$choice" != "0" ]]; then
-        main_menu
-    fi
+    [[ "$choice" != "0" ]] && main_menu # Loop back
 }
 
 # --- Script Initialization ---
 check_root
-clear # Clear screen before starting
-echo_info "Initializing Sing-box Management Script..."
+clear
+echo_info "Initializing Sing-box Management Script (Version: ${SCRIPT_VERSION})..."
 check_os
-check_dependencies # Crucial step
+check_dependencies
 
 # Start main menu
 main_menu
